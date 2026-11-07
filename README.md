@@ -39,12 +39,14 @@ Model-specific Registers (MSRs) via the hardware monitor
 
 2. Energy consumed by each Core
    MSR_CORE_ENERGY_STATUS/ C001_029A:
-   32-bitRO, Accumulator, core-level power reporting
+  Read-only cumulative core energy counter. It is 32-bit on legacy models;
+  some newer supported models expose a 64-bit counter.
 
 3. Energy consumed by Socket
    MSR_PACKAGE_ENERGY_STATUS/ C001_029B:
-   32-bitRO, Accumulator, socket-level power reporting,
-   shared with all cores in socket
+  Read-only cumulative socket energy counter, shared by cores in the socket.
+  It is 32-bit on legacy models; some newer supported models expose a 64-bit
+  counter.
 
 These registers are updated every 1ms and cleared on
 reset of the system.
@@ -55,7 +57,7 @@ reading those registers from the sibling threads would result
 in duplicate values. Hence, energy counter entries are not
 populated for the siblings.
 
-Energy Caluclation
+Energy Calculation
 ------------------
 
 Energy information (in Joules) is based on the multiplier,
@@ -72,30 +74,34 @@ Users calculate power for a given domain by calculating
 Energy accumulation
 --------------------------
 
-Current, Socket energy status register is 32bit, assuming a 240W
-2P system, the register would wrap around in
+For a 32-bit socket counter with an energy unit of 15.3 micro-Joules per
+count, assuming 240W total across two equally loaded sockets (120W per socket),
+the counter wraps in approximately:
 
-`2^32*15.3 e-6/240 * 2 = 547.60833024` secs to wrap(~9 mins)
+`2^32 * 15.3e-6 / 120 = 547.6` seconds (about 9 minutes).
 
-The Core energy register may wrap around after several days.
+At 240W per socket, the same counter wraps in about 274 seconds. Actual wrap
+time depends on the energy unit and socket power. Core-counter wrap time also
+depends on the energy unit and per-core power; it should not be assumed to be
+several days.
 
-To improve the wrap around time, a kernel thread is implemented
-to accumulate the socket energy counters and one core energy counter
-per run to a respective 64-bit counter. The kernel thread starts
-running during probe, wakes up every 100secs and stops running
-when driver is removed.
+For supported CPUs with 32-bit counters, a kernel thread accumulates socket
+energy and rotates through the core counters, adding each sampled delta to a
+64-bit software counter. It starts during probe and stops when the driver is
+removed. Each iteration samples every socket and one core; the core is changed
+on the next iteration.
 
-Frequency of the accumulator thread is set during the probe
-based on the chosen energy unit resolution. For example
-A. fine grain (1.625 micro J)
-B. course grain (0.125 milli J)
+The accumulator interval is calculated during probe from the energy unit,
+using a 250W power assumption to sample before a 32-bit counter can wrap. It
+is not a fixed 100-second interval.
 
 A socket and core energy read would return the current register
 value added to the respective energy accumulator.
 
-On newer EPYC CPUs with 64bit RAPL energy MSRs, software accumulation
-of energy counters is not required. Hence, accumulation is enabled
-only on select EPYC CPUs with 32bit RAPL MSRs.
+On supported AMD CPUs with 64-bit RAPL energy MSRs, the driver reads the
+counters directly without software accumulation. Accumulation is used for the
+specific AMD models listed in the driver as having 32-bit counters; this list
+includes Ryzen and APU models as well as EPYC models.
 
 Sysfs attributes
 ----------------
