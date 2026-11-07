@@ -103,83 +103,112 @@ Sysfs attributes
 | Attribute       | Label             | Description                                                  |
 | --------------- | ----------------- | ------------------------------------------------------------ |
 | energy[X]_input | Ecore[X] energy   | X = [0] to [nr_cpus - 1] Measured input core energy          |
-| energy[X]_input | Esocket[X] energy | X = [nr_cpus] to [nr_socks - 1] Measured input socket energy |
+| energy[X]_input | Esocket[X] energy | X = [nr_cpus] to [nr_cpus + nr_socks - 1] Measured input socket energy |
+
+Updates and Validation
+----------------------
+
+Recent updates improve compatibility with newer kernels and reliability of
+energy readings. The driver now handles 64-bit RAPL counters without
+truncation, checks MSR read failures, maps sensor channels using CPU topology,
+and uses corrected counter-wrap and cache timing logic. The build, install,
+and DKMS instructions have also been clarified.
+
+These updates were developed with assistance from GitHub Copilot and tested
+on hardware running Fedora 44, Linux kernel 7.2.15, and an AMD Ryzen 9 7950X.
 
 Build and Install
 -----------------
 
-Kernel development packages for the running kernel need to be installed
-prior to building the Energy module. A Makefile is provided which should
-work with most kernel source trees.
+You need a C compiler, `make`, and the development headers for the kernel you
+want to build against. Install the headers matching your running kernel. For
+example:
 
-To build the kernel module:
+| Distribution | Prerequisites |
+| ------------ | ------------- |
+| Fedora | `sudo dnf install gcc make kernel-devel-$(uname -r)` |
+| Debian/Ubuntu | `sudo apt install build-essential linux-headers-$(uname -r)` |
+| Arch Linux | `sudo pacman -S base-devel linux-headers` |
+
+For Arch Linux, install the headers package matching your kernel variant (for
+example, `linux-lts-headers` for `linux-lts`).
+
+Run the following commands from the directory containing this repository.
+By default, the Makefile builds against the running kernel using
+`/lib/modules/$(uname -r)/build`.
+
+Build the module:
+```sh
+make
 ```
-#> make
+
+Install it, refresh the module dependency map, and load it:
+```sh
+sudo make modules_install
+sudo depmod -a
+sudo modprobe zenergy
 ```
-To install the kernel module:
+
+Confirm that the driver registered with hwmon:
+```sh
+grep -H '^zenergy$' /sys/class/hwmon/hwmon*/name
 ```
-#> sudo make modules_install
+The matching `hwmonN` directory contains the `energy*_input` readings.
+
+To build and install for a kernel other than the running one, set `KDIR` to
+that kernel's build directory. These commands also derive the matching kernel
+release for `depmod`:
+```sh
+KDIR=/path/to/kernel/build
+KERNEL_RELEASE=$(make -s -C "$KDIR" kernelrelease)
+make KDIR="$KDIR"
+sudo make modules_install KDIR="$KDIR"
+sudo depmod -a "$KERNEL_RELEASE"
 ```
-To clean the kernel module build directory:
-```
-#> make clean
+Boot into that kernel before loading the module with `modprobe`.
+
+To remove generated build files:
+```sh
+make clean
 ```
 
 Loading
 -------
 
-If the Energy module was installed you should use the modprobe command to
-load the module.
-```
-#> sudo modprobe zenergy
-```
-The Energy module can also be loaded using insmod if the module was not
-installed:
-```
-#> sudo insmod ./zenergy.ko
+If you built the module but did not install it, load it from the repository
+directory with:
+```sh
+sudo insmod ./zenergy.ko
 ```
 
 DKMS support
 ------------
 
-Building Module with running version of kernel
+DKMS requires the source in `/usr/src/zenergy-<version>`. The repository's
+`dkms.conf` uses `@VERSION@` as a packaging placeholder, so substitute a
+version when staging a checkout. From the repository directory, run:
 
-Add the module to DKMS tree:
+```sh
+VERSION=1.0
+sudo install -d "/usr/src/zenergy-$VERSION"
+sudo install -m 644 Makefile zenergy.c "/usr/src/zenergy-$VERSION/"
+sed "s/@VERSION@/$VERSION/" dkms.conf | sudo tee "/usr/src/zenergy-$VERSION/dkms.conf" >/dev/null
+sudo dkms add -m zenergy -v "$VERSION"
+sudo dkms build -m zenergy -v "$VERSION" -k "$(uname -r)"
+sudo dkms install --force -m zenergy -v "$VERSION" -k "$(uname -r)"
+sudo modprobe zenergy
 ```
-#> sudo dkms add ../zenergy
-```
-Build the module using DKMS:
-```
-#> sudo dkms build -m zenergy/1.0
-```
-Install the module using DKMS:
-```
-#> sudo dkms install --force zenergy/1.0
-```
-Load the module:
-```
-#> sudo modprobe zenergy
-```
-Building Module with specific version of kernel
 
-Add the module to DKMS tree:
-```
-#> sudo dkms add ../zenergy
-```
-Build the module using DKMS:
-```
-#> sudo dkms build zenergy/1.0 -k linux_version
-```
-Install the module using DKMS:
-```
-#> sudo dkms install --force zenergy/1.0 -k linux_version
-```
-Module is built: /lib/modules/linux_version/updates/dkms/
+Use `--force` when replacing a module previously installed with
+`make modules_install`; it lets DKMS replace that existing copy.
 
-Notes: It is required to have specific linux verion header in /usr/src
+Install the matching kernel development headers before building. To target a
+different installed kernel, replace `$(uname -r)` in the build and install
+commands with that kernel's release; its headers must be installed as well.
+After booting the target kernel, load the module with `sudo modprobe zenergy`.
 
-To remove module from dkms tree
+Remove the DKMS registration with:
+```sh
+sudo dkms remove -m zenergy -v 1.0 --all
 ```
-#> sudo dkms remove -m zenergy/1.0 --all
-#> sudo rm -rf /usr/src/zenergy-1.0/
 ```

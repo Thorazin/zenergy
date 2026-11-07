@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/processor.h>
@@ -46,6 +47,11 @@ struct sensor_accumulator {
 	unsigned long cache_timeout;
 };
 
+struct zenergy_core {
+	int package_id;
+	int core_id;
+};
+
 struct zenergy_data {
 	struct hwmon_channel_info energy_info;
 	const struct hwmon_channel_info *info[2];
@@ -60,10 +66,38 @@ struct zenergy_data {
 	int energy_units;
 	int nr_cpus;
 	int nr_socks;
+	int *socket_ids;
+	struct zenergy_core *cores;
 	int core_id;
 	char (*label)[10];
 	bool do_not_accum;
 };
+
+static int zenergy_socket_cpu(struct zenergy_data *data, int socket)
+{
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		if (topology_physical_package_id(cpu) == data->socket_ids[socket])
+			return cpu;
+	}
+
+	return -ENODEV;
+}
+
+static int zenergy_core_cpu(struct zenergy_data *data, int core)
+{
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		if (topology_physical_package_id(cpu) ==
+				data->cores[core].package_id &&
+		    topology_core_id(cpu) == data->cores[core].core_id)
+			return cpu;
+	}
+
+	return -ENODEV;
+}
 
 static int zenergy_read_labels(struct device *dev,
 				  enum hwmon_sensor_types type,
@@ -76,28 +110,42 @@ static int zenergy_read_labels(struct device *dev,
 	return 0;
 }
 
-static void get_energy_units(struct zenergy_data *data)
+static int get_energy_units(struct zenergy_data *data)
 {
 	u64 rapl_units;
+	int ret;
 
 #if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
-	rdmsrq_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
+	ret = rdmsrq_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
 #else
-	rdmsrl_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
+	ret = rdmsrl_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
 #endif
+	if (ret)
+		return ret;
+
 	data->energy_units = (rapl_units & zenergy_UNIT_MASK) >> 8;
+	return 0;
 }
 
-static void __accumulate_delta(struct sensor_accumulator *accum,
-			       int cpu, u32 reg)
+static int read_energy_msr(int cpu, u32 reg, u64 *value)
+{
+#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
+	return rdmsrq_safe_on_cpu(cpu, reg, value);
+#else
+	return rdmsrl_safe_on_cpu(cpu, reg, value);
+#endif
+}
+
+static int __accumulate_delta(struct sensor_accumulator *accum,
+			      int cpu, u32 reg)
 {
 	u64 input;
+	int ret;
 
-#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
-	rdmsrq_safe_on_cpu(cpu, reg, &input);
-#else
-	rdmsrl_safe_on_cpu(cpu, reg, &input);
-#endif
+	ret = read_energy_msr(cpu, reg, &input);
+	if (ret)
+		return ret;
+
 	input &= zenergy_MASK;
 
 	if (input >= accum->prev_value)
@@ -105,38 +153,51 @@ static void __accumulate_delta(struct sensor_accumulator *accum,
 			input - accum->prev_value;
 	else
 		accum->energy_ctr += UINT_MAX -
-			accum->prev_value + input;
+			accum->prev_value + input + 1;
 
 	accum->prev_value = input;
-	accum->cache_timeout = (jiffies + HZ + get_random_long()) % HZ;
+	accum->cache_timeout = jiffies + HZ + (get_random_long() % HZ);
+	return 0;
 }
 
-static void accumulate_delta(struct zenergy_data *data,
-			     int channel, int cpu, u32 reg)
+static int accumulate_delta(struct zenergy_data *data,
+			    int channel, int cpu, u32 reg)
 {
+	int ret;
+
 	mutex_lock(&data->lock);
-	__accumulate_delta(&data->accums[channel], cpu, reg);
+	ret = __accumulate_delta(&data->accums[channel], cpu, reg);
 	mutex_unlock(&data->lock);
+	return ret;
 }
 
 static void read_accumulate(struct zenergy_data *data)
 {
 	int sock, scpu, cpu;
+	int ret;
 
 	for (sock = 0; sock < data->nr_socks; sock++) {
-		scpu = cpumask_first_and(cpu_online_mask,
-					 cpumask_of_node(sock));
+		scpu = zenergy_socket_cpu(data, sock);
+		if (scpu < 0)
+			continue;
 
-		accumulate_delta(data, data->nr_cpus + sock,
-				 scpu, ENERGY_PKG_MSR);
+		ret = accumulate_delta(data, data->nr_cpus + sock,
+				       scpu, ENERGY_PKG_MSR);
+		if (ret)
+			pr_warn_ratelimited("%s: failed to read MSR 0x%x on CPU %d: %d\n",
+					    DRVNAME, ENERGY_PKG_MSR, scpu, ret);
 	}
 
 	if (data->core_id >= data->nr_cpus)
 		data->core_id = 0;
 
-	cpu = data->core_id;
-	if (cpu_online(cpu))
-		accumulate_delta(data, cpu, cpu, ENERGY_CORE_MSR);
+	cpu = zenergy_core_cpu(data, data->core_id);
+	if (cpu >= 0) {
+		ret = accumulate_delta(data, data->core_id, cpu, ENERGY_CORE_MSR);
+		if (ret)
+			pr_warn_ratelimited("%s: failed to read MSR 0x%x on CPU %d: %d\n",
+					    DRVNAME, ENERGY_CORE_MSR, cpu, ret);
+	}
 
 	data->core_id++;
 }
@@ -150,16 +211,17 @@ static int zenergy_read(struct device *dev,
 	u64 energy;
 	u32 reg;
 	int cpu;
+	int ret = 0;
 
 	if (channel >= data->nr_cpus) {
-		cpu = cpumask_first_and(cpu_online_mask,
-					cpumask_of_node
-					(channel - data->nr_cpus));
+		cpu = zenergy_socket_cpu(data, channel - data->nr_cpus);
+		if (cpu < 0)
+			return cpu;
 		reg = ENERGY_PKG_MSR;
 	} else {
-		cpu = channel;
-		if (!cpu_online(cpu))
-			return -ENODEV;
+		cpu = zenergy_core_cpu(data, channel);
+		if (cpu < 0)
+			return cpu;
 
 		reg = ENERGY_CORE_MSR;
 	}
@@ -167,12 +229,19 @@ static int zenergy_read(struct device *dev,
 	accum = &data->accums[channel];
 
 	mutex_lock(&data->lock);
-	if (!accum->energy_ctr || time_after(jiffies, accum->cache_timeout))
-		__accumulate_delta(accum, cpu, reg);
-	energy = accum->energy_ctr;
+	if (data->do_not_accum) {
+		ret = read_energy_msr(cpu, reg, &energy);
+	} else {
+		if (!accum->energy_ctr || time_after(jiffies, accum->cache_timeout))
+			ret = __accumulate_delta(accum, cpu, reg);
+		energy = accum->energy_ctr;
+	}
 	mutex_unlock(&data->lock);
+	if (ret)
+		return ret;
 
-	*val = div64_ul(energy * 1000000UL, BIT(data->energy_units));
+	*val = mul_u64_u64_div_u64(energy, 1000000,
+				   BIT(data->energy_units));
 
 	return 0;
 }
@@ -216,36 +285,53 @@ static int amd_create_sensor(struct device *dev,
 			     enum hwmon_sensor_types type, u32 config)
 {
 	struct hwmon_channel_info *info = &data->energy_info;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
-	struct cpuinfo_x86 *c = &boot_cpu_data;
-	int num_siblings;
-#endif
 	struct sensor_accumulator *accums;
-	int i, cpus, sockets;
+	struct zenergy_core *cores;
+	int i, cpu, package_id, core_id, cpus, sockets, max_cpus;
+	int *socket_ids;
 	u32 *s_config;
 	char (*label_l)[10];
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
-	/* Identify the number of siblings per core */
-	num_siblings = ((cpuid_ebx(0x8000001e) >> 8) & 0xff) + 1;
+	max_cpus = num_present_cpus();
+	if (!max_cpus)
+		return -ENODEV;
 
-	/*
-	 * Energy counter register is accessed at core level.
-	 * Hence, filterout the siblings.
-	 */
-	cpus = num_present_cpus() / num_siblings;
+	socket_ids = devm_kcalloc(dev, max_cpus,
+				 sizeof(*socket_ids), GFP_KERNEL);
+	if (!socket_ids)
+		return -ENOMEM;
+	cores = devm_kcalloc(dev, max_cpus, sizeof(*cores), GFP_KERNEL);
+	if (!cores)
+		return -ENOMEM;
 
-	/*
-	 * topology_num_cores_per_package (or c->x86_max_cores prior to 6.9) is
-	 * the linux count of physical cores.
-	 * total physical cores/ core per socket gives total number of sockets.
-	 */
+	cpus = 0;
+	sockets = 0;
+	for_each_present_cpu(cpu) {
+		package_id = topology_physical_package_id(cpu);
+		core_id = topology_core_id(cpu);
+		if (package_id < 0 || core_id < 0)
+			return -EINVAL;
 
-	sockets = cpus / c->x86_max_cores;
-#else
-	cpus = num_present_cpus() / __max_threads_per_core;
-	sockets = cpus / topology_num_cores_per_package();
-#endif
+		for (i = 0; i < sockets; i++) {
+			if (socket_ids[i] == package_id)
+				break;
+		}
+		if (i == sockets)
+			socket_ids[sockets++] = package_id;
+
+		for (i = 0; i < cpus; i++) {
+			if (cores[i].package_id == package_id &&
+			    cores[i].core_id == core_id)
+				break;
+		}
+		if (i == cpus) {
+			cores[cpus].package_id = package_id;
+			cores[cpus].core_id = core_id;
+			cpus++;
+		}
+	}
+	if (!sockets || !cpus)
+		return -ENODEV;
 
 	s_config = devm_kcalloc(dev, cpus + sockets + 1,
 				sizeof(u32), GFP_KERNEL);
@@ -268,6 +354,8 @@ static int amd_create_sensor(struct device *dev,
 
 	data->nr_cpus = cpus;
 	data->nr_socks = sockets;
+	data->socket_ids = socket_ids;
+	data->cores = cores;
 	data->accums = accums;
 	data->label = label_l;
 
@@ -328,7 +416,11 @@ static int zenergy_probe(struct platform_device *pdev)
 		return ret;
 
 	mutex_init(&data->lock);
-	get_energy_units(data);
+	ret = get_energy_units(data);
+	if (ret) {
+		dev_err(dev, "failed to read energy unit MSR: %d\n", ret);
+		return ret;
+	}
 
 	hwmon_dev = devm_hwmon_device_register_with_info(dev, DRVNAME,
 							 data,
